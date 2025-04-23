@@ -51,6 +51,7 @@ struct ArgParser {
     command: Commands,
 }
 
+ 
 #[derive(Subcommand, Debug)]
 enum Commands {
     #[clap(arg_required_else_help = true)]
@@ -682,7 +683,7 @@ async fn process_file(
 
     // If output file is local, write directly to file
     let mut output_data: Vec<u8> = Vec::new();
-
+    let mut removed_output_data: Vec<u8> = Vec::new();
 
     // Loop over lines and do bff stuff
     let mut count = 0;
@@ -692,7 +693,7 @@ async fn process_file(
     for line in lines {
         let line = line?;
         count += 1;
-        let (dedup_data, removed_line_bytes, total_line_bytes) = match *remove_type {
+        let (dedup_data, removed_line_bytes, total_line_bytes, removed_paragraphs ) = match *remove_type {
             RemoveType::Exact => {
                 process_line_exact(&line, &bloom_filter, no_update_bloom_filter, annotate)
             }
@@ -716,7 +717,7 @@ async fn process_file(
                 } 
                 */
                     
-            },
+            } 
             RemoveType::OldBoth => {
                 process_line_oldboth(&line, &bloom_filter, min_ngram_size, max_ngram_size,
                                      filtering_threshold, no_update_bloom_filter, annotate)
@@ -724,11 +725,11 @@ async fn process_file(
 
 
             RemoveType::NaiveBoth => {
-                let (doc_dedup, doc_removed_bytes, doc_total_bytes) = 
+                let (doc_dedup, doc_removed_bytes, doc_total_bytes, removed_paragraph) = 
                     process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
                          &RemoveType::Document, filtering_threshold, no_update_bloom_filter, annotate);
                 if doc_removed_bytes > 0 { 
-                    (doc_dedup, doc_removed_bytes, doc_total_bytes)
+                    (doc_dedup, doc_removed_bytes, doc_total_bytes, removed_paragraph)
                 } else { // and if document should NOT be removed, then do paragraph level
                     process_line(&line, &bloom_filter, min_ngram_size, max_ngram_size,
                          &RemoveType::Paragraph, filtering_threshold, no_update_bloom_filter, annotate)     
@@ -749,6 +750,15 @@ async fn process_file(
             output_data.extend(serde_json::to_vec(&dedup_data).unwrap());
             output_data.extend(b"\n");         
         }        
+
+        if !removed_paragraphs.is_empty() {
+            let joined = removed_paragraphs.join("\n");
+            let json_line = serde_json::json!({ "text": joined });
+            removed_output_data.extend(serde_json::to_vec(&json_line).unwrap());
+            removed_output_data.extend(b"\n");
+        }
+
+
     }
 
     // Handle output files
@@ -775,7 +785,31 @@ async fn process_file(
             
         }
     }
+    let removed_output_file = PathBuf::from("removed_output.removed.jsonl");
 
+    let removed_output_data = compress_data(removed_output_data, &removed_output_file);
+
+    if !removed_output_data.is_empty() {
+        if is_s3(&removed_output_file) {
+            let (removed_bucket, removed_key) = split_s3_path(&removed_output_file);
+            let client = get_s3_client().await;
+            let _ = client
+                .put_object()
+                .bucket(removed_bucket)
+                .key(removed_key)
+                .body(ByteStream::from(removed_output_data))
+                .send()
+                .await;
+        } else {
+            let mut removed_file = OpenOptions::new()
+                .read(false)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&removed_output_file)?;
+            removed_file.write_all(&removed_output_data)?;
+        }
+    }
 
     match pbar_option {
         Some(pbar) => {
@@ -788,9 +822,10 @@ async fn process_file(
 }
 
 
+
 fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size: usize,
                remove_type: &RemoveType, filtering_threshold: f64, no_update_bloom_filter: bool, annotate: bool) ->  
-    (serde_json::Value, usize, usize) {
+    (serde_json::Value, usize, usize, Vec<String>) {
     // Main BFF logic: processes a single json document
     // Does the following (handling the {paragraph, document, both} cases)
     // 1. Breaks document into units (paragraph/both -> paragraph; document -> full text)
@@ -805,6 +840,7 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize
 
     // Outputs are (output_json, total_removed_bytes, total_input_bytes)
     // If annotate is turned on, nothing gets removed, text is left intact, but byte-windows-removed
+    let removed_paragraphs_fake : Vec<String> = Vec::new();
 
 
     let mut data: Value = serde_json::from_str(&line).unwrap();
@@ -894,18 +930,19 @@ fn process_line(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize
         data["text"] = Value::String(output_paragraphs);
     }
 
-    (data, removed_bytes, total_bytes)
+    (data, removed_bytes, total_bytes, removed_paragraphs_fake)
 }
 
 
 fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_size: usize,
                            no_update_bloom_filter: bool, annotate: bool, substr_seqlen: usize, 
                            fuzzy_threshold: f64) -> 
-    (serde_json::Value, usize, usize) {
+    (serde_json::Value, usize, usize, Vec<String>) {
     let mut data: Value = serde_json::from_str(&line).unwrap();
     let text = data["text"].as_str().unwrap();
     let mut total_tokens: usize = 0;
     let total_bytes = text.len();
+    let removed_paragraphs_fake : Vec<String> = Vec::new();
 
     // Step 1: Get contained ngram indices, and map from ngram/token idx -> text idx
     let mut hashes : Vec<Vec<u64>> = Vec::new(); // Note: hashes[i] is the hash of tokens[i..i + max_ngram_size]
@@ -927,7 +964,7 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_s
         }
     }
     if hashes.len() == 0 { // Too short of document, do nothing, return early
-        return (data, 0, total_tokens);
+        return (data, 0, total_tokens, removed_paragraphs_fake);
     }
     tokenidx2textidx.push(text.len()); // bookend 
     // UPDATE 
@@ -1001,7 +1038,7 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_s
     } else {
         data["text"] = Value::String(output_str.trim_end().to_string());    
     }
-    (data, total_bytes - output_str.len(), total_bytes as usize)
+    (data, total_bytes - output_str.len(), total_bytes as usize, removed_paragraphs_fake)
 
 }
 
@@ -1010,7 +1047,8 @@ fn process_line_substring(line: &String, bloom_filter: &BloomFilter, max_ngram_s
 
 fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size: usize,
                filtering_threshold: f64, no_update_bloom_filter: bool, annotate: bool) -> 
-    (serde_json::Value, usize, usize) {
+    (serde_json::Value, usize, usize, Vec<String>) {
+        let removed_paragraphs_fake : Vec<String> = Vec::new();
 
     /* Actual paragraph+document level deduplication (but quite complicated)
     Here's the plan:
@@ -1110,7 +1148,7 @@ fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: 
     let total_contains: usize = contained_ngram_counts.iter().sum::<usize>();
     
     if total_ngrams == 0 { // No ngrams, doc was too short, return defaults
-        return (data, 0, total_bytes as usize);
+        return (data, 0, total_bytes as usize, removed_paragraphs_fake);
     }
 
     if (total_contains as f64) / total_ngrams as f64 >= filtering_threshold { // remove whole doc
@@ -1121,7 +1159,7 @@ fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: 
         }  else {
             data["text"] = Value::String(String::new());
         }
-        return (data, total_bytes, total_bytes)
+        return (data, total_bytes, total_bytes, removed_paragraphs_fake)
     }
 
     // Okay, now do a clever interleaved loop over the paragraphs
@@ -1196,7 +1234,7 @@ fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: 
         data["text"] = Value::String(output_text.trim_end().to_string());
     }   
 
-    (data, total_bytes - output_text.len() as usize, total_bytes as usize)
+    (data, total_bytes - output_text.len() as usize, total_bytes as usize, removed_paragraphs_fake)
 
 }
 
@@ -1205,11 +1243,12 @@ fn process_line_both(line: &String, bloom_filter: &BloomFilter, min_ngram_size: 
 
 fn process_line_oldboth(line: &String, bloom_filter: &BloomFilter, min_ngram_size: usize, max_ngram_size:usize, 
                         filtering_threshold: f64, no_update_bloom_filter: bool, annotate: bool) 
-    -> (serde_json::Value, usize, usize){
+    -> (serde_json::Value, usize, usize, Vec<String>){
     let mut data: Value = serde_json::from_str(&line).unwrap();
     let mut total_items = 0;
     let mut removed_items = 0;
     let text = data["text"].as_str().unwrap();
+    let mut removed_paragraphs = Vec::new();
 
 
     let newlines = if false {
@@ -1264,6 +1303,10 @@ fn process_line_oldboth(line: &String, bloom_filter: &BloomFilter, min_ngram_siz
             contained_ngrams as f64 / number_of_ngrams as f64 > filtering_threshold;
         if too_many_duplicate_ngrams {
             windows_to_remove.push(paragraph_window);
+            let removed_text = &text[paragraph_window[0]..paragraph_window[1]];
+            let cleaned = removed_text.trim_start();
+            removed_paragraphs.push(cleaned.to_string());
+            println!("removed_paraaa: {:?}", removed_paragraphs);
             removed_items += 1;
         } else if !no_update_bloom_filter {
             for ngram in hashes {
@@ -1281,12 +1324,21 @@ fn process_line_oldboth(line: &String, bloom_filter: &BloomFilter, min_ngram_siz
         let mut output_paragraphs = String::new();
         let mut last_end = 0;
         for paragraph_window in windows_to_remove {
+            let output_paragraph = &text[last_end..paragraph_window[0]];
+            println!("output paragraph: {}", output_paragraph);
             output_paragraphs.push_str(&text[last_end..paragraph_window[0]]);
             last_end = paragraph_window[1];
         }
         output_paragraphs.push_str(&text[last_end..]);
         if (total_contained_ngrams as f64) / (total_ngrams as f64) > filtering_threshold {
             output_paragraphs = String::new(); // If we found enough duplicates to remove whole document too
+             println!("found enough dups!!");
+
+            removed_paragraphs = text
+            .split('\n')
+            .filter(|p| !p.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect();
         }
         data["text"] = Value::String(output_paragraphs);
         data["bff_contained_ngram_count_before_dedupe"] =
@@ -1308,16 +1360,17 @@ fn process_line_oldboth(line: &String, bloom_filter: &BloomFilter, min_ngram_siz
             map.retain(|key, _| allowed_fields.contains(&key.as_str()));
             }
     }
-    (data, removed_items, total_items)
+    (data, removed_items, total_items, removed_paragraphs)
 }
 
 
 
 
 fn process_line_exact(line: &String, bloom_filter: &BloomFilter, no_update_bloom_filter: bool, annotate: bool) ->
-    (serde_json::Value, usize, usize) {
+    (serde_json::Value, usize, usize, Vec<String>) {
     // Hacky "exact dedup" using bloom filters
     // Just hashes the WHOLE text 
+    let removed_paragraphs_fake : Vec<String> = Vec::new();
 
     let mut data: Value = serde_json::from_str(&line).unwrap();
     let mut removed_bytes = 0;
@@ -1343,7 +1396,7 @@ fn process_line_exact(line: &String, bloom_filter: &BloomFilter, no_update_bloom
         }
     }   
 
-    return (data, removed_bytes, total_bytes)
+    return (data, removed_bytes, total_bytes, removed_paragraphs_fake)
 }
 
 
